@@ -1,13 +1,16 @@
 import os
 import torch.utils.data
+import torch.nn.functional as F
 from torch.nn import DataParallel
 from datetime import datetime
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, ReduceLROnPlateau
 from config import BATCH_SIZE, PROPOSAL_NUM, SAVE_FREQ, LR, WD, resume, save_dir
 from core import model, dataset
 from core.utils import init_log, progress_bar
+import copy
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+torch.manual_seed(1234)
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 start_epoch = 1
 save_dir = os.path.join(save_dir, datetime.now().strftime('%Y%m%d_%H%M%S'))
 if os.path.exists(save_dir):
@@ -17,10 +20,10 @@ logging = init_log(save_dir)
 _print = logging.info
 
 # read dataset
-trainset = dataset.CUB(root='./CUB_200_2011', is_train=True, data_len=None)
+trainset = dataset.CUB(root='../datasets/IXS_80_2018', is_train=True, data_len=None)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE,
                                           shuffle=True, num_workers=8, drop_last=False)
-testset = dataset.CUB(root='./CUB_200_2011', is_train=False, data_len=None)
+testset = dataset.CUB(root='../datasets/IXS_80_2018', is_train=False, data_len=None)
 testloader = torch.utils.data.DataLoader(testset, batch_size=BATCH_SIZE,
                                          shuffle=False, num_workers=8, drop_last=False)
 # define model
@@ -31,26 +34,36 @@ if resume:
     start_epoch = ckpt['epoch'] + 1
 creterion = torch.nn.CrossEntropyLoss()
 
+
 # define optimizers
 raw_parameters = list(net.pretrained_model.parameters())
 part_parameters = list(net.proposal_net.parameters())
 concat_parameters = list(net.concat_net.parameters())
 partcls_parameters = list(net.partcls_net.parameters())
 
-raw_optimizer = torch.optim.SGD(raw_parameters, lr=LR, momentum=0.9, weight_decay=WD)
-concat_optimizer = torch.optim.SGD(concat_parameters, lr=LR, momentum=0.9, weight_decay=WD)
-part_optimizer = torch.optim.SGD(part_parameters, lr=LR, momentum=0.9, weight_decay=WD)
-partcls_optimizer = torch.optim.SGD(partcls_parameters, lr=LR, momentum=0.9, weight_decay=WD)
-schedulers = [MultiStepLR(raw_optimizer, milestones=[60, 100], gamma=0.1),
-              MultiStepLR(concat_optimizer, milestones=[60, 100], gamma=0.1),
-              MultiStepLR(part_optimizer, milestones=[60, 100], gamma=0.1),
-              MultiStepLR(partcls_optimizer, milestones=[60, 100], gamma=0.1)]
+raw_optimizer = torch.optim.SGD(raw_parameters, lr=LR, momentum=0.9, weight_decay=WD, nesterov=True)
+concat_optimizer = torch.optim.SGD(concat_parameters, lr=LR, momentum=0.9, weight_decay=WD, nesterov=True)
+part_optimizer = torch.optim.SGD(part_parameters, lr=LR, momentum=0.9, weight_decay=WD, nesterov=True)
+partcls_optimizer = torch.optim.SGD(partcls_parameters, lr=LR, momentum=0.9, weight_decay=WD, nesterov=True)
+# schedulers = [MultiStepLR(raw_optimizer, milestones=[100, 160], gamma=0.1),
+#               MultiStepLR(concat_optimizer, milestones=[100, 160], gamma=0.1),
+#               MultiStepLR(part_optimizer, milestones=[100, 160], gamma=0.1),
+#               MultiStepLR(partcls_optimizer, milestones=[100, 160], gamma=0.1)]
+
+schedulers = [ReduceLROnPlateau(raw_optimizer, patience=50, verbose=True),
+              ReduceLROnPlateau(concat_optimizer, patience=50, verbose=True),
+              ReduceLROnPlateau(part_optimizer, patience=50, verbose=True),
+              ReduceLROnPlateau(partcls_optimizer, patience=50, verbose=True)]
+
 net = net.cuda()
 net = DataParallel(net)
 
+best_model_wts = copy.deepcopy(net.state_dict())
+best_acc = 0.0
+
 for epoch in range(start_epoch, 500):
-    for scheduler in schedulers:
-        scheduler.step()
+    # for scheduler in schedulers:
+    #     scheduler.step()
     ##########################  train the model  ###############################
     _print('--' * 50)
     net.train()
@@ -66,12 +79,22 @@ for epoch in range(start_epoch, 500):
         part_loss = model.list_loss(part_logits.view(batch_size * PROPOSAL_NUM, -1),
                                     label.unsqueeze(1).repeat(1, PROPOSAL_NUM).view(-1)).view(batch_size, PROPOSAL_NUM)
         raw_loss = creterion(raw_logits, label)
+        # raw_log_softmax = F.log_softmax(raw_logits, dim=-1)
+        # raw_nllloss = F.nll_loss(raw_log_softmax, label)
+
         concat_loss = creterion(concat_logits, label)
+
+        concat_log_softmax = F.log_softmax(concat_logits, dim=-1)
+        concat_nllloss = F.nll_loss(concat_log_softmax, label)
+        # concat_l1loss = F.l1_loss(concat_logits, label)
+
         rank_loss = model.ranking_loss(top_n_prob, part_loss)
         partcls_loss = creterion(part_logits.view(batch_size * PROPOSAL_NUM, -1),
                                  label.unsqueeze(1).repeat(1, PROPOSAL_NUM).view(-1))
 
+
         total_loss = raw_loss + rank_loss + concat_loss + partcls_loss
+        # total_loss = raw_loss + rank_loss + concat_loss + partcls_loss + concat_nllloss
         total_loss.backward()
         raw_optimizer.step()
         part_optimizer.step()
@@ -102,6 +125,9 @@ for epoch in range(start_epoch, 500):
 
         train_acc = float(train_correct) / total
         train_loss = train_loss / total
+
+        for scheduler in schedulers:
+            scheduler.step(train_loss)
 
         _print(
             'epoch:{} - train loss: {:.3f} and train acc: {:.3f} total sample: {}'.format(
@@ -137,17 +163,31 @@ for epoch in range(start_epoch, 500):
                 test_acc,
                 total))
 
-        ##########################  save model  ###############################
-        net_state_dict = net.module.state_dict()
-        if not os.path.exists(save_dir):
-            os.mkdir(save_dir)
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_model_wts = copy.deepcopy(net.state_dict())
+        print("best acc: ", best_acc)
         torch.save({
             'epoch': epoch,
             'train_loss': train_loss,
             'train_acc': train_acc,
             'test_loss': test_loss,
             'test_acc': test_acc,
-            'net_state_dict': net_state_dict},
+            'net_state_dict': best_model_wts},
             os.path.join(save_dir, '%03d.ckpt' % epoch))
 
+        ##########################  save model  ###############################
+        # net_state_dict = net.module.state_dict()
+        # if not os.path.exists(save_dir):
+        #     os.mkdir(save_dir)
+        # torch.save({
+        #     'epoch': epoch,
+        #     'train_loss': train_loss,
+        #     'train_acc': train_acc,
+        #     'test_loss': test_loss,
+        #     'test_acc': test_acc,
+        #     'net_state_dict': net_state_dict},
+        #     os.path.join(save_dir, '%03d.ckpt' % epoch))
+
 print('finishing training')
+
