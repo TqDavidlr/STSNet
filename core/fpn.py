@@ -36,11 +36,11 @@ class Bottleneck(nn.Module):
 class FPN(nn.Module):
     def __init__(self, block, num_blocks):
         super(FPN, self).__init__()
-        self.in_planes = 64
+        self.in_planes = 128
 
-        self.conv1 = nn.Conv2d(2048, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        # self.conv1 = nn.Conv2d(2048, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
+        # self.conv1 = nn.Conv2d(2048, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv2d(2048, 128, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(128)
 
         # Bottom-up layers
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
@@ -49,21 +49,21 @@ class FPN(nn.Module):
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
 
         # Top layer
-        # 我们需要在C5后面接一个1x1, 71 conv，得到金字塔最顶端的feature
-        self.toplayer = nn.Conv2d(2048, 71, kernel_size=1, stride=1, padding=0)  # Reduce channels
+        # 我们需要在C5后面接一个1x1, 6 conv，得到金字塔最顶端的feature
+        self.toplayer = nn.Conv2d(2048, 6, kernel_size=1, stride=1, padding=0)  # Reduce channels
 
         # Lateral layers
         # 为了匹配channel dimension引入的1x1卷积
-        # 注意这些backbone之外的extra conv，输出都是71 channel
-        self.latlayer1 = nn.Conv2d(1024, 71, kernel_size=1, stride=1, padding=0)
-        self.latlayer2 = nn.Conv2d(512, 71, kernel_size=1, stride=1, padding=0)
-        self.latlayer3 = nn.Conv2d(256, 71, kernel_size=1, stride=1, padding=0)
+        # 注意这些backbone之外的extra conv，输出都是6 channel
+        self.latlayer1 = nn.Conv2d(1024, 6, kernel_size=1, stride=1, padding=0)
+        self.latlayer2 = nn.Conv2d(512, 6, kernel_size=1, stride=1, padding=0)
+        self.latlayer3 = nn.Conv2d(256, 6, kernel_size=1, stride=1, padding=0)
 
         # Smooth layers
         # 这个是上面引文中提到的抗aliasing的3x3卷积
-        self.smooth1 = nn.Conv2d(71, 71, kernel_size=3, stride=1, padding=1)
-        self.smooth2 = nn.Conv2d(71, 71, kernel_size=3, stride=1, padding=1)
-        self.smooth3 = nn.Conv2d(71, 71, kernel_size=3, stride=1, padding=1)
+        self.smooth1 = nn.Conv2d(71, 6, kernel_size=3, stride=1, padding=1)
+        self.smooth2 = nn.Conv2d(71, 6, kernel_size=3, stride=1, padding=1)
+        self.smooth3 = nn.Conv2d(71, 6, kernel_size=3, stride=1, padding=1)
 
         # self.smooth = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
 
@@ -100,7 +100,7 @@ class FPN(nn.Module):
         # print('batch_size:', batch_size)  # 16
         # Bottom-up
         c1 = F.relu(self.bn1(self.conv1(x)))
-        c1 = F.max_pool2d(c1, kernel_size=3, stride=2, padding=1)
+        c1 = F.max_pool2d(c1, kernel_size=3, stride=1, padding=1)
         c2 = self.layer1(c1)
         c3 = self.layer2(c2)
         c4 = self.layer3(c3)
@@ -134,11 +134,11 @@ class FPN(nn.Module):
         # print('p4 shspe:', p4.shape)
         # print('p5 shspe:', p5.shape)
 
-        return torch.cat((p2, p3, p5), dim=1)
+        return torch.cat((p2, p3, p4, p5, p5), dim=1)
 
 
 def FPN101():
-    return FPN(Bottleneck, [3, 4, 6, 3])
+    return FPN(Bottleneck, [3, 4, 23, 3])
     # return FPN(Bottleneck, [2, 2, 2, 2])
 
 def test():
